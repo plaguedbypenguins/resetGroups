@@ -1,0 +1,167 @@
+#!/bin/sh
+
+# rjh; Tue 28 Feb 2023 18:44:30 AEDT
+#
+# reset file and dir group ownerships to match project names, and setgid on dirs
+
+# nominated lustre client node to run this script on
+clientnode=gina777
+
+# location of this script and the utilities it calls
+loc=/opt/root
+
+# root of the lustre filesystem. eg. if this is "fred" then all projects dirs are /fred/oz*
+filesystem="fred"
+
+# write tmp files and log files to this directory
+odir=/jobfs/local/system/resetGroups
+
+if [ `hostname` != "$clientnode" ]; then
+   echo run this on $clientnode
+   exit 1
+fi
+
+echo 500 > /proc/sys/vm/vfs_cache_pressure
+
+cd /$filesystem
+
+d=`date +%F-%T`
+mkdir -p $odir
+
+# oz002 and oz100 are projects that have a vast amount of files and subdirs.
+# sweep them at the next level down. eg. sweep oz100/*/ instead of oz100/
+
+for p in oz002/* oz100/* oz*; do      # list of paths to sweep
+   if [ $p = "oz002" -o $p = "oz100" ]; then
+      continue
+   fi
+   if [ -L $p ]; then   # skip symlinks
+      continue
+   fi
+   o=`echo $p | sed "s+/+_+g"`   # take out / in the name
+   g=`echo $p | cut -d/ -f1`     # find project name ~= group
+   gid=`getent group $g | cut -d: -f3`
+
+   # 2 sweeps - file and dir group ownerships, dir perms.
+   # lfs find doesn't support -perm or -links, so can't use lfs find for everything.
+   # note:
+   # things eg. conda trees, can be hard-linked to each other in /fred and we
+   # don't want to just flip-flop the group ownership on each sweep.
+   # so jump through some hoops to check multiply-linked files are at least in
+   # one oz* group (and not just in 'sut')
+   ( lfs find $p ! -gid $gid -type f -print0 > $odir/"$o.$d.list.f" ;\
+     lfs find $p ! -gid $gid ! -type f -print0 > $odir/"$o.$d.list" ;\
+     $loc/findMultiplyLinkedFiles.py /$filesystem < $odir/"$o.$d.list.f" >> $odir/"$o.$d.list" ;\
+     rm $odir/"$o.$d.list.f" ;\
+     find $p -mount -type d ! -perm -g=s -print0 > $odir/"$o.$d.list.d" ;\
+   ) > $odir/$o.$d 2>&1 &
+
+   while [ `jobs | grep Running | wc -l` -ge 10 ]; do
+      sleep 1
+   done
+done
+wait
+
+# do chgrp's on files and dirs
+for p in oz002/* oz100/* oz*; do      # list of paths to sweep
+   if [ $p = "oz002" -o $p = "oz100" ]; then
+      continue
+   fi
+   if [ -L $p ]; then   # skip symlinks
+      continue
+   fi
+   o=`echo $p | sed "s+/+_+g"`   # take out / in the name
+   g=`echo $p | cut -d/ -f1`     # find project name ~= group
+
+   if [ -s $odir/"$o.$d.list" ]; then
+      # make list without \0's in them - more human readable.
+      #   - split0 is way faster than alternatives via xargs 'cos of exec load to /images
+      $loc/split0.py 1 $odir/"$o.$d.split" n < $odir/"$o.$d.list" 
+      mv $odir/"$o.$d.split0" $odir/"$o.$d"
+
+      # if list is long, then split it into many parts for parallelism.
+      # 'split' by lines doesn't work with nulls instead of \n, so use a python code
+      len=`cat $odir/"$o.$d" | wc -l`
+      if [ $len -gt 1000 ]; then
+         # 10 chunks
+         $loc/split0.py 10 $odir/"$o.$d.split" 0 < $odir/"$o.$d.list"
+
+         for i in {0..10}; do    # allow for a mistake that might make 11 files
+            if [ -e $odir/"$o.$d.split$i" ]; then
+               #echo xargs -0 -n5 chgrp -h $g \< $odir/"$o.$d.split$i" \> $odir/"$o.$d.$i"
+               xargs -0 -n5 chgrp -h $g < $odir/"$o.$d.split$i" > $odir/"$o.$d.$i" 2>&1 &
+            fi
+         done
+      else
+         #echo xargs -0 -n5 chgrp -h $g \< $odir/"$o.$d.list" \>\> $odir/$o.$d
+         xargs -0 -n5 chgrp -h $g < $odir/"$o.$d.list" >> $odir/$o.$d 2>&1 &
+      fi
+   fi
+
+   while [ `jobs | grep Running | wc -l` -ge 15 ]; do
+      sleep 1
+   done
+done
+wait
+
+# concat output from the chgrp's into one file
+for p in oz002/* oz100/* oz*; do      # list of paths to sweep
+   if [ $p = "oz002" -o $p = "oz100" ]; then
+      continue
+   fi
+   if [ -L $p ]; then   # skip symlinks
+      continue
+   fi
+   o=`echo $p | sed "s+/+_+g"`   # take out / in the name
+
+   if [ -e $odir/"$o.$d.0" ]; then
+      for i in {0..10}; do    # allow for a mistake that might make 11 files
+         if [ -e $odir/"$o.$d.$i" ]; then
+            cat $odir/"$o.$d.$i" >> $odir/"$o.$d"
+            rm $odir/"$o.$d.$i"
+            rm $odir/"$o.$d.split$i"
+         fi
+      done
+   fi
+done
+
+# chmods on dirs
+for p in oz002/* oz100/* oz*; do      # list of paths to sweep
+   if [ $p = "oz002" -o $p = "oz100" ]; then
+      continue
+   fi
+   if [ -L $p ]; then   # skip symlinks
+      continue
+   fi
+   o=`echo $p | sed "s+/+_+g"`   # take out / in the name
+
+   if [ -s $odir/"$o.$d.list.d" ]; then
+        ( xargs -0 -I{} echo {} < $odir/"$o.$d.list.d" ;\
+          xargs -0 -n5 chmod g+s < $odir/"$o.$d.list.d" ) >> $odir/$o.$d 2>&1 &
+   fi
+
+   while [ `jobs | grep Running | wc -l` -ge 10 ]; do
+      sleep 1
+   done
+done
+wait
+
+# tidy
+for p in oz002/* oz100/* oz*; do      # list of paths to sweep
+   if [ $p = "oz002" -o $p = "oz100" ]; then
+      continue
+   fi
+   if [ -L $p ]; then   # skip symlinks
+      continue
+   fi
+   o=`echo $p | sed "s+/+_+g"`   # take out / in the name
+
+   rm $odir/"$o.$d.list"
+   rm $odir/"$o.$d.list.d"
+done
+
+echo 100 > /proc/sys/vm/vfs_cache_pressure
+
+wait
+
+exit 0
